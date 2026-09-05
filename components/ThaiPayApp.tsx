@@ -189,7 +189,7 @@ export default function ThaiPayApp() {
           </div>
         )}
 
-        {screen !== "scan" && screen !== "review" && screen !== "result" && (
+        {screen !== "review" && screen !== "result" && (
           <nav className="bottom-nav">
             <button className={screen === "home" ? "active" : ""} onClick={() => setScreen("home")}><Home size={20} /><span>Home</span></button>
             <button onClick={() => setScreen("scan")} className="nav-scan"><QrCode size={22} /></button>
