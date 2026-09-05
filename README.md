@@ -1,37 +1,52 @@
 # ThaiPay MVP
 
-Mobile-first PWA for scanning Thai PromptPay QR codes and testing Xendit payout routing.
+Mobile-first PWA for scanning Thai PromptPay QR codes and testing Xendit Thailand payout routing.
 
-## What is implemented
+## Current scope
+
+ThaiPay currently provides a **safe sandbox payout prototype**, not a live Revolut-to-PromptPay remittance product.
+
+Implemented:
 
 - iPhone/Android camera QR scanner plus image upload
-- EMVCo TLV / PromptPay decoder
-- Detects PromptPay credit-transfer AID `A000000677010111`
-- Extracts phone or national-ID proxies when present
-- Detects Bill Payment AID `A000000677010112` and blocks unsafe payout reinterpretation
-- CRC-16 validation
+- Bank of Thailand Thai QR / EMVCo TLV decoder
+- PromptPay tag `29` detection
+- Merchant-presented PromptPay AID `A000000677010111`
+- Customer-presented AID `A000000677010114` detection and blocking
+- Bill Payment tag `30` detection including domestic AID `A000000677010112` and cross-border AID `A000000677012006`
+- Mobile proxy mapping to Xendit `MOBILE_NO`
+- National-ID / Tax-ID ambiguity is surfaced to the user instead of guessed
+- CRC-16 validation; invalid/unverifiable QRs cannot be paid
+- Fixed amount protection for dynamic QRs
 - Xendit Payout API v3 server route (`POST /v3/payouts`)
-- Xendit payout status endpoint (`GET /api/payout/:id`)
-- Authenticated Xendit payout webhook endpoint (`POST /api/xendit/webhook`)
-- Xendit development-key detection and hard live-key safety lock
-- Local sandbox payment history
+- Deterministic idempotency key per payment intent
+- Server-side re-decode of the original QR; client routing fields are not trusted
+- Same-origin check on the payout write route
+- Xendit payout status polling and final success/failure UI
+- Authenticated Xendit payout webhook endpoint (`x-callback-token`)
+- Xendit API health check without exposing balance or secret data
+- Local sandbox transaction history
 - Installable PWA shell
+- Hard live-payout gate and separate foreign-card bridge approval gate
 
-## Verified Xendit facts
+## Architecture boundary
 
-Xendit's current Payout API v3 uses `/v3/payouts` with API version `2025-09-01`. Thailand is supported over the local PromptPay payout rail in THB. Xendit documents a maximum transaction amount of THB 2,000,000 and routing types including `MOBILE_NO`, `NATIONAL_ID` and `BUSINESS_REG_NO`. Amounts in Payout API v3 are sent in minor units.
+Xendit supports a Thailand Local PromptPay payout rail, but **ordinary card acquiring must not be used as an unapproved payment intermediary / aggregator for unrelated third-party beneficiaries**. Therefore this repository does not enable `foreign card -> arbitrary PromptPay recipient` merely by combining Xendit Cards and Payouts.
 
-Xendit's documented THB **balance top-up** method is bank transfer + proof upload. Card acceptance / foreign-card processing is a separate Money-In product. Therefore this project does **not** pretend that charging a Revolut/Visa/Mastercard and immediately forwarding those funds to an arbitrary PromptPay recipient is already approved.
+The intended live architecture must be explicitly approved by Xendit under the appropriate regulated product, likely involving Remittance, Banking-as-a-Service or E-Money-as-a-Service. See `docs/XENDIT_APPROVAL_CHECKLIST.md`.
 
-Xendit also documents Pay-On-Behalf-Of (POBO) as case-by-case approval, commonly involving remittance licensing. A live tourist wallet / card-to-PromptPay product therefore requires explicit approval for the exact funding and payout model.
+## Environment
 
-## Important architecture boundary
+```bash
+XENDIT_SECRET_KEY=xnd_development_...
+XENDIT_ALLOW_LIVE=false
+XENDIT_CARD_BRIDGE_APPROVED=false
+XENDIT_WEBHOOK_TOKEN=...
+```
 
-The current MVP is a **sandbox + payout-rail prototype**. It can safely decode supported personal PromptPay proxies and exercise the Xendit development payout flow, but live consumer card funding remains locked until Xendit approves the use case.
+Never expose the secret key as `NEXT_PUBLIC_*` and never commit it to GitHub.
 
-Not every Thai QR is a generic PromptPay payout address. Personal PromptPay proxies can be extracted from compatible QRs; bill-payment and some merchant QRs require their own payment rail and are intentionally blocked.
-
-## Setup
+## Local setup
 
 ```bash
 npm install
@@ -39,34 +54,24 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Set `XENDIT_SECRET_KEY` to a **development** key. Never expose it as a `NEXT_PUBLIC_*` variable or commit it to GitHub.
+## Live gate
 
-For webhooks, also set `XENDIT_WEBHOOK_TOKEN` from the Xendit Dashboard webhook settings.
+Do not set either live flag to `true` until all of the following are complete:
 
-### Vercel
+1. Xendit confirms the correct legal entity / onboarding path for the business.
+2. Thailand PromptPay payout corridor is enabled for the account.
+3. Exact Thailand routing-value formats are confirmed.
+4. Xendit approves the end-user funding/remittance structure.
+5. Foreign-issued card funding is explicitly approved for this structure.
+6. End-user KYC/AML ownership, limits and monitoring are defined.
+7. Persistent transaction storage, authentication, device binding and production rate limiting are added.
+8. Webhook token is configured and payout state is persisted server-side.
 
-Add these as server-side Environment Variables:
+## Key public references
 
-- `XENDIT_SECRET_KEY`
-- `XENDIT_WEBHOOK_TOKEN`
-- `XENDIT_ALLOW_LIVE=false`
-
-Configure the Xendit payout webhook URL as:
-
-`https://YOUR-DEPLOYMENT/api/xendit/webhook`
-
-Keep live mode disabled during testing.
-
-## Live checklist
-
-1. Correct Xendit business type/KYC.
-2. Thailand PromptPay payout corridor enabled for the account.
-3. Confirm the exact Thailand recipient field requirements with Xendit.
-4. Obtain written approval for the intended foreign-card / e-money funding model.
-5. Configure payout webhooks and persistent server-side transaction storage.
-6. Add user authentication, rate limiting, device binding and strong transaction confirmation.
-7. Only then consider `XENDIT_ALLOW_LIVE=true`.
-
-## Security
-
-The Xendit Secret API Key must only exist server-side. The repository intentionally contains placeholders only. Uploaded/private API credentials must never be committed to this public repository.
+- Xendit Thailand payout coverage: https://docs.xendit.co/docs/payout-coverage-thailand
+- Xendit Payout API v3: https://docs.xendit.co/apidocs/create-payout-v3
+- Xendit payout status: https://docs.xendit.co/apidocs/get-payout-v3-by-id
+- Xendit balance API: https://docs.xendit.co/apidocs/get-balance
+- Xendit regional product terms: https://www.xendit.co/en/legal-regional-product/
+- Bank of Thailand Thai QR Payment Standard: https://www.bot.or.th/content/dam/bot/documents/th/our-roles/payment-systems/about-payment-systems/ThaiQRCode_Payment_Standard.pdf

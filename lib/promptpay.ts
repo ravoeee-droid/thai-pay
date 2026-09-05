@@ -1,5 +1,12 @@
-export type PromptPayKind = "personal" | "merchant" | "bill" | "unknown";
+export type PromptPayKind = "promptpay" | "customer_presented" | "bill" | "unknown";
 export type PromptPayRouting = "MOBILE_NO" | "NATIONAL_ID" | "BUSINESS_REG_NO";
+export type PromptPayProxyType =
+  | "phone"
+  | "national_or_tax_id"
+  | "ewallet"
+  | "bank_account"
+  | "merchant_id"
+  | "unknown";
 
 export type PromptPayData = {
   raw: string;
@@ -9,15 +16,27 @@ export type PromptPayData = {
   country?: string;
   amount?: number;
   merchantName?: string;
+  merchantCity?: string;
+  referenceLabel?: string;
+  poiMethod?: "static" | "dynamic" | "unknown";
   kind: PromptPayKind;
-  proxyType?: "phone" | "national_id" | "ewallet" | "merchant_id";
+  aid?: string;
+  accountTag?: string;
+  proxyType?: PromptPayProxyType;
   proxyValue?: string;
+  rawProxyValue?: string;
   routingType?: PromptPayRouting;
+  routingChoiceRequired?: boolean;
   payoutCompatible: boolean;
   note?: string;
 };
 
 type Tlv = { id: string; value: string };
+
+const PROMPTPAY_MERCHANT_AID = "A000000677010111";
+const PROMPTPAY_CUSTOMER_AID = "A000000677010114";
+const BILL_PAYMENT_AID = "A000000677010112";
+const CROSS_BORDER_BILL_PAYMENT_AID = "A000000677012006";
 
 function tlv(input: string): Tlv[] {
   const result: Tlv[] = [];
@@ -66,6 +85,12 @@ function validateCrc(raw: string) {
   return crc16CcittFalse(raw.slice(0, -4)) === provided;
 }
 
+function poiMethod(value?: string): PromptPayData["poiMethod"] {
+  if (value === "11") return "static";
+  if (value === "12") return "dynamic";
+  return value ? "unknown" : undefined;
+}
+
 export function maskPromptPay(value?: string) {
   if (!value) return "–";
   if (value.length <= 6) return value;
@@ -76,85 +101,151 @@ export function decodePromptPay(payload: string): PromptPayData {
   const raw = payload.trim();
   const top = tlv(raw);
   const validFormat = field(top, "00") === "01" && top.length > 2;
+  const validCrc = validateCrc(raw);
   const currency = field(top, "53");
   const country = field(top, "58");
   const amountRaw = field(top, "54");
   const amount = amountRaw ? Number.parseFloat(amountRaw) : undefined;
   const merchantName = field(top, "59")?.trim() || undefined;
+  const merchantCity = field(top, "60")?.trim() || undefined;
+  const extra = tlv(field(top, "62") || "");
+  const referenceLabel = field(extra, "05")?.trim() || undefined;
 
   const base: PromptPayData = {
     raw,
     validFormat,
-    validCrc: validateCrc(raw),
+    validCrc,
     currency,
     country,
     amount: Number.isFinite(amount) ? amount : undefined,
     merchantName,
+    merchantCity,
+    referenceLabel,
+    poiMethod: poiMethod(field(top, "01")),
     kind: "unknown",
     payoutCompatible: false
   };
 
-  if (!validFormat) return { ...base, note: "Kein gültiger EMVCo/PromptPay QR-Code erkannt." };
-  if (currency && currency !== "764") return { ...base, note: "QR-Code verwendet nicht THB (ISO 764)." };
+  if (!validFormat) return { ...base, note: "Kein gültiger EMVCo/Thai-QR erkannt." };
+  if (validCrc !== true) {
+    return {
+      ...base,
+      note: validCrc === false ? "CRC-Prüfung fehlgeschlagen. QR wird aus Sicherheitsgründen blockiert." : "QR enthält keine verifizierbare CRC-Prüfsumme."
+    };
+  }
+  if (currency !== "764") return { ...base, note: "QR verwendet nicht THB (ISO 764)." };
+  if (country && country !== "TH") return { ...base, note: "QR ist nicht als Thailand-Zahlung gekennzeichnet." };
 
-  const accountFields = top.filter(({ id }) => {
-    const n = Number.parseInt(id, 10);
-    return n >= 26 && n <= 51;
-  });
-
-  for (const account of accountFields) {
-    const nested = tlv(account.value);
+  // Bank of Thailand Thai QR Payment Standard reserves top-level tag 29 for
+  // PromptPay credit transfer with a PromptPay ID.
+  const promptPay = top.find((item) => item.id === "29");
+  if (promptPay) {
+    const nested = tlv(promptPay.value);
     const aid = field(nested, "00");
 
-    // BOT PromptPay credit-transfer AID.
-    if (aid === "A000000677010111") {
+    if (aid === PROMPTPAY_CUSTOMER_AID) {
+      return {
+        ...base,
+        kind: "customer_presented",
+        aid,
+        accountTag: "29",
+        payoutCompatible: false,
+        note: "Customer-presented PromptPay QR erkannt. Dieser QR ist kein Empfänger-Payout-Ziel."
+      };
+    }
+
+    if (aid === PROMPTPAY_MERCHANT_AID) {
       const phone = field(nested, "01");
-      const nationalId = field(nested, "02");
+      const nationalOrTaxId = field(nested, "02");
       const ewallet = field(nested, "03");
+      const bankAccount = field(nested, "04");
 
       if (phone) {
         return {
           ...base,
-          kind: merchantName ? "merchant" : "personal",
+          kind: "promptpay",
+          aid,
+          accountTag: "29",
           proxyType: "phone",
+          rawProxyValue: phone,
           proxyValue: normalizePhone(phone),
           routingType: "MOBILE_NO",
           payoutCompatible: true,
-          note: "PromptPay-Mobilnummer erkannt."
+          note: "PromptPay-Mobilnummer erkannt und CRC verifiziert."
         };
       }
-      if (nationalId) {
+
+      if (nationalOrTaxId) {
         return {
           ...base,
-          kind: merchantName ? "merchant" : "personal",
-          proxyType: "national_id",
-          proxyValue: nationalId,
-          routingType: "NATIONAL_ID",
+          kind: "promptpay",
+          aid,
+          accountTag: "29",
+          proxyType: "national_or_tax_id",
+          rawProxyValue: nationalOrTaxId,
+          proxyValue: nationalOrTaxId,
+          routingChoiceRequired: true,
           payoutCompatible: true,
-          note: "PromptPay-ID erkannt."
+          note: "13-stellige National-ID oder Tax-ID erkannt. Vor Auszahlung muss der Typ bestätigt werden."
         };
       }
+
       if (ewallet) {
         return {
           ...base,
-          kind: "merchant",
+          kind: "promptpay",
+          aid,
+          accountTag: "29",
           proxyType: "ewallet",
+          rawProxyValue: ewallet,
           proxyValue: ewallet,
           payoutCompatible: false,
-          note: "E-Wallet/Merchant-Identifier erkannt. Xendit-Payout-Mapping muss hierfür separat freigeschaltet werden."
+          note: "PromptPay E-Wallet-ID erkannt. Für diesen Proxy ist noch kein sicher bestätigtes Xendit-Payout-Mapping hinterlegt."
         };
       }
-    }
 
-    // BOT Bill Payment AID. A bill/merchant QR cannot safely be converted into a generic payout proxy.
-    if (aid === "A000000677010112") {
+      if (bankAccount) {
+        return {
+          ...base,
+          kind: "promptpay",
+          aid,
+          accountTag: "29",
+          proxyType: "bank_account",
+          rawProxyValue: bankAccount,
+          proxyValue: bankAccount,
+          payoutCompatible: false,
+          note: "PromptPay Bankkonto-Identifier erkannt. Laut BOT ist dieses Feld reserviert; automatisches Routing bleibt gesperrt."
+        };
+      }
+
+      return {
+        ...base,
+        kind: "promptpay",
+        aid,
+        accountTag: "29",
+        note: "PromptPay AID erkannt, aber kein unterstützter Empfänger-Proxy gefunden."
+      };
+    }
+  }
+
+  // Bank of Thailand reserves tag 30 for Bill Payment / merchant identifiers.
+  const bill = top.find((item) => item.id === "30");
+  if (bill) {
+    const nested = tlv(bill.value);
+    const aid = field(nested, "00");
+    if (aid === BILL_PAYMENT_AID || aid === CROSS_BORDER_BILL_PAYMENT_AID) {
       return {
         ...base,
         kind: "bill",
+        aid,
+        accountTag: "30",
         proxyType: "merchant_id",
+        rawProxyValue: field(nested, "01"),
         proxyValue: field(nested, "01"),
         payoutCompatible: false,
-        note: "Bill-Payment/Merchant-QR erkannt. Dieser QR braucht einen eigenen Payment-Rail und wird nicht als Payout umgedeutet."
+        note: aid === CROSS_BORDER_BILL_PAYMENT_AID
+          ? "Cross-border Bill-Payment QR erkannt. Dieser braucht einen eigenen Payment-Rail."
+          : "Bill-Payment/Merchant-QR erkannt. Dieser wird nicht als generischer PromptPay-Payout umgedeutet."
       };
     }
   }
